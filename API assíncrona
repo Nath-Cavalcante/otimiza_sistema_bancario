@@ -1,0 +1,325 @@
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
+from fastapi import FastAPI, APIRouter, Body, status, Depends, Query, HTTPException
+from fastapi_pagination import add_pagination, Page, paginate, Params
+
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, select
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import IntegrityError
+
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
+
+
+# ====================================================================
+# 1. CONFIGURAÇÃO DO BANCO DE DADOS
+# ====================================================================
+
+# Cria a engine do banco de dados (SQLite in memory para demonstração)
+SQLALCHEMY_DATABASE_URL = "sqlite:///./app_crossfit.db"
+
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+)
+
+# Base Declarativa para os modelos SQLAlchemy
+Base = declarative_base()
+
+# Cria uma SessionLocal, que será usada para cada requisição.
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Dependency para obter a sessão do banco de dados (usada nas rotas)
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ====================================================================
+# 2. MODELOS (SQLAlchemy ORM)
+# ====================================================================
+
+class CategoriaModel(Base):
+    """Modelo SQLAlchemy para a tabela Categoria."""
+    __tablename__ = 'categorias'
+
+    pk_id = Column(Integer, primary_key=True, index=True)
+    nome = Column(String(50), unique=True, nullable=False)
+
+    atletas = relationship("AtletaModel", back_populates="categoria")
+
+
+class CentroTreinamentoModel(Base):
+    """Modelo SQLAlchemy para a tabela Centro de Treinamento (CT)."""
+    __tablename__ = 'centros_treinamento'
+
+    pk_id = Column(Integer, primary_key=True, index=True)
+    nome = Column(String(50), unique=True, nullable=False)
+    endereco = Column(String(100), nullable=False)
+    proprietario = Column(String(50), nullable=False)
+
+    atletas = relationship("AtletaModel", back_populates="centro_treinamento")
+
+
+class AtletaModel(Base):
+    """Modelo SQLAlchemy para a tabela Atleta."""
+    __tablename__ = 'atletas'
+
+    pk_id = Column(Integer, primary_key=True, index=True)
+    nome = Column(String(50), nullable=False)
+    cpf = Column(String(11), unique=True, nullable=False)  # CPF é único
+    idade = Column(Integer, nullable=False)
+    peso = Column(Float, nullable=False)
+    altura = Column(Float, nullable=False)
+    sexo = Column(String(1), nullable=False)
+    data_criacao = Column(DateTime, default=datetime.utcnow)
+
+    categoria_id = Column(Integer, ForeignKey('categorias.pk_id'))
+    centro_treinamento_id = Column(Integer, ForeignKey('centros_treinamento.pk_id'))
+
+    categoria = relationship("CategoriaModel", back_populates="atletas")
+    centro_treinamento = relationship("CentroTreinamentoModel", back_populates="atletas")
+
+
+# Cria as tabelas no banco de dados
+Base.metadata.create_all(bind=engine)
+
+
+# ====================================================================
+# 3. SCHEMAS (Pydantic)
+# ====================================================================
+
+# Schemas de Entrada (INPUT)
+class CategoriaIn(BaseModel):
+    nome: str = Field(..., description='Nome da categoria', example='Iniciante', max_length=50)
+
+class CentroTreinamentoIn(BaseModel):
+    nome: str = Field(..., description='Nome do CT', example='CT Thunder', max_length=50)
+    endereco: str = Field(..., description='Endereço do CT', example='Rua X, 100', max_length=100)
+    proprietario: str = Field(..., description='Nome do proprietário', example='Marcos Vinicius', max_length=50)
+
+class AtletaIn(BaseModel):
+    nome: str = Field(..., description='Nome do atleta', example='Joao', max_length=50)
+    cpf: str = Field(..., description='CPF do atleta', example='12345678900', max_length=11)
+    idade: PositiveInt = Field(..., description='Idade do atleta', example=25)
+    peso: PositiveFloat = Field(..., description='Peso do atleta', example=75.5)
+    altura: PositiveFloat = Field(..., description='Altura do atleta', example=1.70)
+    sexo: str = Field(..., description='Sexo do atleta', example='M', max_length=1)
+    
+    categoria_nome: str = Field(..., description='Nome da categoria', example='Iniciante', max_length=50)
+    centro_treinamento_nome: str = Field(..., description='Nome do CT', example='CT Thunder', max_length=50)
+
+
+# Schemas de Saída (OUTPUT) - Base
+class CategoriaOut(CategoriaIn):
+    pk_id: int
+    class Config:
+        orm_mode = True
+
+class CentroTreinamentoOut(CentroTreinamentoIn):
+    pk_id: int
+    class Config:
+        orm_mode = True
+
+# Schemas de Saída (OUTPUT) - Atleta Completo
+class AtletaOut(AtletaIn):
+    pk_id: int
+    data_criacao: datetime
+    class Config:
+        orm_mode = True
+
+# Schema de Saída Customizado (OUTPUT) - Listagem de Atletas (Requisito)
+class AtletaCustomOut(BaseModel):
+    """
+    Schema de resposta customizada para a listagem de atletas (GET All).
+    Inclui apenas nome, CT e Categoria.
+    """
+    nome: str = Field(..., description='Nome do atleta', example='Joao')
+    centro_treinamento: str = Field(..., description='Nome do CT', example='CT Thunder')
+    categoria: str = Field(..., description='Nome da categoria', example='Iniciante')
+
+
+# ====================================================================
+# 4. ROTAS (ENDPOINTS)
+# ====================================================================
+
+# Routers
+router_categorias = APIRouter()
+router_centros = APIRouter()
+router_atletas = APIRouter()
+
+
+# ------------------ Rotas de CATEGORIAS ------------------
+
+@router_categorias.post(
+    '/', 
+    summary='Criar uma nova Categoria',
+    status_code=status.HTTP_201_CREATED,
+    response_model=CategoriaOut
+)
+async def post_categoria(db: Session = Depends(get_db), categoria_in: CategoriaIn = Body(...)):
+    categoria_model = CategoriaModel(**categoria_in.dict())
+    db.add(categoria_model)
+    db.commit()
+    db.refresh(categoria_model)
+    return categoria_model
+
+@router_categorias.get(
+    '/',
+    summary='Consultar todas as Categorias',
+    status_code=status.HTTP_200_OK,
+    response_model=List[CategoriaOut]
+)
+async def query_categorias(db: Session = Depends(get_db)) -> List[CategoriaOut]:
+    categorias = db.query(CategoriaModel).all()
+    return categorias
+
+
+# ------------------ Rotas de CENTROS DE TREINAMENTO ------------------
+
+@router_centros.post(
+    '/', 
+    summary='Criar um novo Centro de Treinamento',
+    status_code=status.HTTP_201_CREATED,
+    response_model=CentroTreinamentoOut
+)
+async def post_ct(db: Session = Depends(get_db), ct_in: CentroTreinamentoIn = Body(...)):
+    ct_model = CentroTreinamentoModel(**ct_in.dict())
+    db.add(ct_model)
+    db.commit()
+    db.refresh(ct_model)
+    return ct_model
+
+@router_centros.get(
+    '/',
+    summary='Consultar todos os Centros de Treinamento',
+    status_code=status.HTTP_200_OK,
+    response_model=List[CentroTreinamentoOut]
+)
+async def query_ct(db: Session = Depends(get_db)) -> List[CentroTreinamentoOut]:
+    centros = db.query(CentroTreinamentoModel).all()
+    return centros
+
+
+# ------------------ Rotas de ATLETAS ------------------
+
+@router_atletas.post(
+    '/', 
+    summary='Criar um novo Atleta',
+    status_code=status.HTTP_201_CREATED,
+    response_model=AtletaOut
+)
+async def post_atleta(db: Session = Depends(get_db), atleta_in: AtletaIn = Body(...)):
+    # 1. Busca Categoria e CT
+    categoria = db.query(CategoriaModel).filter(CategoriaModel.nome == atleta_in.categoria_nome).first()
+    ct = db.query(CentroTreinamentoModel).filter(CentroTreinamentoModel.nome == atleta_in.centro_treinamento_nome).first()
+    
+    if not categoria:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f'Categoria {atleta_in.categoria_nome} não encontrada.'
+        )
+    
+    if not ct:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f'Centro de Treinamento {atleta_in.centro_treinamento_nome} não encontrado.'
+        )
+
+    try:
+        # 2. Cria o modelo do Atleta
+        atleta_model = AtletaModel(
+            **atleta_in.dict(exclude={'categoria_nome', 'centro_treinamento_nome'}),
+            categoria_id=categoria.pk_id,
+            centro_treinamento_id=ct.pk_id
+        )
+        
+        # 3. Adiciona e Commita
+        db.add(atleta_model)
+        db.commit()
+        db.refresh(atleta_model)
+        
+        return atleta_model
+
+    # 4. Manipulação de exceção de integridade para CPF duplicado
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_303_SEE_OTHER,  # Status 303: See Other
+            detail=f"Já existe um atleta cadastrado com o cpf: {atleta_in.cpf}"
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"Erro ao cadastrar atleta: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Ocorreu um erro interno do servidor.'
+        )
+
+
+@router_atletas.get(
+    '/',
+    summary='Consultar Atletas (com Filtros e Paginação)',
+    status_code=status.HTTP_200_OK,
+    response_model=Page[AtletaCustomOut]  # Response Customizado e Paginação
+)
+async def query_atletas(
+    db: Session = Depends(get_db),
+    params: Params = Depends(),
+    nome: Optional[str] = Query(None, description="Filtrar por nome do atleta"),
+    cpf: Optional[str] = Query(None, description="Filtrar por CPF do atleta")
+) -> Page[AtletaCustomOut]:
+    """
+    Endpoint para listar atletas com paginação e filtros por nome ou CPF.
+    """
+    # 1. Construir a query base com JOINs para acessar nome do CT e Categoria
+    query_stmt = select(
+        AtletaModel.nome, 
+        CentroTreinamentoModel.nome.label('centro_treinamento'), 
+        CategoriaModel.nome.label('categoria')
+    ).join(
+        CentroTreinamentoModel, AtletaModel.centro_treinamento_id == CentroTreinamentoModel.pk_id
+    ).join(
+        CategoriaModel, AtletaModel.categoria_id == CategoriaModel.pk_id
+    )
+    
+    # 2. Aplicar filtros de Query Parameter
+    if nome:
+        query_stmt = query_stmt.where(AtletaModel.nome.ilike(f'%{nome}%'))
+    if cpf:
+        query_stmt = query_stmt.where(AtletaModel.cpf == cpf)
+
+    # 3. Executar a query
+    resultados = db.execute(query_stmt).all()
+    
+    # 4. Customizar o retorno para o schema AtletaCustomOut
+    atletas_customizados = [
+        AtletaCustomOut(
+            nome=r.nome, 
+            centro_treinamento=r.centro_treinamento, 
+            categoria=r.categoria
+        ) for r in resultados
+    ]
+    
+    # 5. Aplicar Paginação
+    return paginate(atletas_customizados, params)
+
+
+# ====================================================================
+# 5. APLICAÇÃO PRINCIPAL (MAIN)
+# ====================================================================
+
+app = FastAPI(title='Crossfit API')
+
+# Inclusão das rotas com prefixos e tags
+app.include_router(router_categorias, prefix='/api/v1/categorias', tags=['categorias'])
+app.include_router(router_centros, prefix='/api/v1/centros_treinamento', tags=['centros_treinamento'])
+app.include_router(router_atletas, prefix='/api/v1/atletas', tags=['atletas'])
+
+# Adiciona o suporte a paginação para toda a API
+add_pagination(app)
+
+# Para rodar a aplicação, use o comando: uvicorn app:app --reload
