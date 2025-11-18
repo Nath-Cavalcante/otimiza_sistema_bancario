@@ -4,92 +4,88 @@ from datetime import datetime
 from fastapi import FastAPI, APIRouter, Body, status, Depends, Query, HTTPException
 from fastapi_pagination import add_pagination, Page, paginate, Params
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, select
-from sqlalchemy.orm import sessionmaker, relationship, Session
-from sqlalchemy.ext.declarative import declarative_base
+# Importações Assíncronas do SQLAlchemy
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, select, func
+from sqlalchemy.orm import relationship, sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.future import select as sa_select # Renomeado para evitar conflito
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
 
-
 # ====================================================================
-# 1. CONFIGURAÇÃO DO BANCO DE DADOS
+# 1. CONFIGURAÇÃO DO BANCO DE DADOS ASSÍNCRONO
 # ====================================================================
 
-# Cria a engine do banco de dados (SQLite in memory para demonstração)
-SQLALCHEMY_DATABASE_URL = "sqlite:///./app_crossfit.db"
+# Usamos 'sqlite+aiosqlite' para o driver assíncrono
+SQLALCHEMY_DATABASE_URL = "sqlite+aiosqlite:///./app_crossfit.db"
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+# Cria a engine assíncrona do banco de dados
+async_engine = create_async_engine(
+    SQLALCHEMY_DATABASE_URL, 
+    echo=False, 
+    connect_args={"check_same_thread": False}
 )
 
 # Base Declarativa para os modelos SQLAlchemy
 Base = declarative_base()
 
-# Cria uma SessionLocal, que será usada para cada requisição.
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Cria o SessionLocal assíncrono
+AsyncSessionLocal = async_sessionmaker(
+    async_engine, 
+    expire_on_commit=False, 
+    class_=AsyncSession
+)
 
-# Dependency para obter a sessão do banco de dados (usada nas rotas)
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Funções utilitárias para criar as tabelas
+async def init_db():
+    async with async_engine.begin() as conn:
+        # await conn.run_sync(Base.metadata.drop_all) # Opcional: para limpar o banco
+        await conn.run_sync(Base.metadata.create_all)
 
+# Dependency para obter a sessão assíncrona do banco de dados
+async def get_db_async() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        yield session
 
 # ====================================================================
-# 2. MODELOS (SQLAlchemy ORM)
+# 2. MODELOS (SQLAlchemy ORM) - Sem Alterações Estruturais (Apenas uso do Base)
 # ====================================================================
 
 class CategoriaModel(Base):
     """Modelo SQLAlchemy para a tabela Categoria."""
     __tablename__ = 'categorias'
-
     pk_id = Column(Integer, primary_key=True, index=True)
     nome = Column(String(50), unique=True, nullable=False)
-
     atletas = relationship("AtletaModel", back_populates="categoria")
-
 
 class CentroTreinamentoModel(Base):
     """Modelo SQLAlchemy para a tabela Centro de Treinamento (CT)."""
     __tablename__ = 'centros_treinamento'
-
     pk_id = Column(Integer, primary_key=True, index=True)
     nome = Column(String(50), unique=True, nullable=False)
     endereco = Column(String(100), nullable=False)
     proprietario = Column(String(50), nullable=False)
-
     atletas = relationship("AtletaModel", back_populates="centro_treinamento")
-
 
 class AtletaModel(Base):
     """Modelo SQLAlchemy para a tabela Atleta."""
     __tablename__ = 'atletas'
-
     pk_id = Column(Integer, primary_key=True, index=True)
     nome = Column(String(50), nullable=False)
-    cpf = Column(String(11), unique=True, nullable=False)  # CPF é único
+    cpf = Column(String(11), unique=True, nullable=False)
     idade = Column(Integer, nullable=False)
     peso = Column(Float, nullable=False)
     altura = Column(Float, nullable=False)
     sexo = Column(String(1), nullable=False)
     data_criacao = Column(DateTime, default=datetime.utcnow)
-
     categoria_id = Column(Integer, ForeignKey('categorias.pk_id'))
     centro_treinamento_id = Column(Integer, ForeignKey('centros_treinamento.pk_id'))
-
     categoria = relationship("CategoriaModel", back_populates="atletas")
     centro_treinamento = relationship("CentroTreinamentoModel", back_populates="atletas")
 
-
-# Cria as tabelas no banco de dados
-Base.metadata.create_all(bind=engine)
-
-
 # ====================================================================
-# 3. SCHEMAS (Pydantic)
+# 3. SCHEMAS (Pydantic) - Sem Alterações
 # ====================================================================
 
 # Schemas de Entrada (INPUT)
@@ -112,7 +108,6 @@ class AtletaIn(BaseModel):
     categoria_nome: str = Field(..., description='Nome da categoria', example='Iniciante', max_length=50)
     centro_treinamento_nome: str = Field(..., description='Nome do CT', example='CT Thunder', max_length=50)
 
-
 # Schemas de Saída (OUTPUT) - Base
 class CategoriaOut(CategoriaIn):
     pk_id: int
@@ -131,26 +126,20 @@ class AtletaOut(AtletaIn):
     class Config:
         orm_mode = True
 
-# Schema de Saída Customizado (OUTPUT) - Listagem de Atletas (Requisito)
+# Schema de Saída Customizado (OUTPUT)
 class AtletaCustomOut(BaseModel):
-    """
-    Schema de resposta customizada para a listagem de atletas (GET All).
-    Inclui apenas nome, CT e Categoria.
-    """
     nome: str = Field(..., description='Nome do atleta', example='Joao')
     centro_treinamento: str = Field(..., description='Nome do CT', example='CT Thunder')
     categoria: str = Field(..., description='Nome da categoria', example='Iniciante')
 
-
 # ====================================================================
-# 4. ROTAS (ENDPOINTS)
+# 4. ROTAS (ENDPOINTS) - Uso de `await` e `session.execute()`
 # ====================================================================
 
 # Routers
 router_categorias = APIRouter()
 router_centros = APIRouter()
 router_atletas = APIRouter()
-
 
 # ------------------ Rotas de CATEGORIAS ------------------
 
@@ -160,11 +149,19 @@ router_atletas = APIRouter()
     status_code=status.HTTP_201_CREATED,
     response_model=CategoriaOut
 )
-async def post_categoria(db: Session = Depends(get_db), categoria_in: CategoriaIn = Body(...)):
+async def post_categoria(db: AsyncSession = Depends(get_db_async), categoria_in: CategoriaIn = Body(...)):
+    # Adicionar o objeto diretamente (AsyncSession suporta .add())
     categoria_model = CategoriaModel(**categoria_in.dict())
     db.add(categoria_model)
-    db.commit()
-    db.refresh(categoria_model)
+    try:
+        await db.commit() # Operação assíncrona
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f'Já existe uma categoria com o nome: {categoria_in.nome}'
+        )
+    await db.refresh(categoria_model) # Operação assíncrona
     return categoria_model
 
 @router_categorias.get(
@@ -173,8 +170,11 @@ async def post_categoria(db: Session = Depends(get_db), categoria_in: CategoriaI
     status_code=status.HTTP_200_OK,
     response_model=List[CategoriaOut]
 )
-async def query_categorias(db: Session = Depends(get_db)) -> List[CategoriaOut]:
-    categorias = db.query(CategoriaModel).all()
+async def query_categorias(db: AsyncSession = Depends(get_db_async)) -> List[CategoriaOut]:
+    # Usar sa_select e .scalars().all() para consulta assíncrona
+    stmt = sa_select(CategoriaModel)
+    result = await db.execute(stmt)
+    categorias = result.scalars().all()
     return categorias
 
 
@@ -186,11 +186,18 @@ async def query_categorias(db: Session = Depends(get_db)) -> List[CategoriaOut]:
     status_code=status.HTTP_201_CREATED,
     response_model=CentroTreinamentoOut
 )
-async def post_ct(db: Session = Depends(get_db), ct_in: CentroTreinamentoIn = Body(...)):
+async def post_ct(db: AsyncSession = Depends(get_db_async), ct_in: CentroTreinamentoIn = Body(...)):
     ct_model = CentroTreinamentoModel(**ct_in.dict())
     db.add(ct_model)
-    db.commit()
-    db.refresh(ct_model)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f'Já existe um CT com o nome: {ct_in.nome}'
+        )
+    await db.refresh(ct_model)
     return ct_model
 
 @router_centros.get(
@@ -199,8 +206,10 @@ async def post_ct(db: Session = Depends(get_db), ct_in: CentroTreinamentoIn = Bo
     status_code=status.HTTP_200_OK,
     response_model=List[CentroTreinamentoOut]
 )
-async def query_ct(db: Session = Depends(get_db)) -> List[CentroTreinamentoOut]:
-    centros = db.query(CentroTreinamentoModel).all()
+async def query_ct(db: AsyncSession = Depends(get_db_async)) -> List[CentroTreinamentoOut]:
+    stmt = sa_select(CentroTreinamentoModel)
+    result = await db.execute(stmt)
+    centros = result.scalars().all()
     return centros
 
 
@@ -209,117 +218,4 @@ async def query_ct(db: Session = Depends(get_db)) -> List[CentroTreinamentoOut]:
 @router_atletas.post(
     '/', 
     summary='Criar um novo Atleta',
-    status_code=status.HTTP_201_CREATED,
-    response_model=AtletaOut
-)
-async def post_atleta(db: Session = Depends(get_db), atleta_in: AtletaIn = Body(...)):
-    # 1. Busca Categoria e CT
-    categoria = db.query(CategoriaModel).filter(CategoriaModel.nome == atleta_in.categoria_nome).first()
-    ct = db.query(CentroTreinamentoModel).filter(CentroTreinamentoModel.nome == atleta_in.centro_treinamento_nome).first()
-    
-    if not categoria:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f'Categoria {atleta_in.categoria_nome} não encontrada.'
-        )
-    
-    if not ct:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f'Centro de Treinamento {atleta_in.centro_treinamento_nome} não encontrado.'
-        )
-
-    try:
-        # 2. Cria o modelo do Atleta
-        atleta_model = AtletaModel(
-            **atleta_in.dict(exclude={'categoria_nome', 'centro_treinamento_nome'}),
-            categoria_id=categoria.pk_id,
-            centro_treinamento_id=ct.pk_id
-        )
-        
-        # 3. Adiciona e Commita
-        db.add(atleta_model)
-        db.commit()
-        db.refresh(atleta_model)
-        
-        return atleta_model
-
-    # 4. Manipulação de exceção de integridade para CPF duplicado
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_303_SEE_OTHER,  # Status 303: See Other
-            detail=f"Já existe um atleta cadastrado com o cpf: {atleta_in.cpf}"
-        )
-    except Exception as e:
-        db.rollback()
-        print(f"Erro ao cadastrar atleta: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Ocorreu um erro interno do servidor.'
-        )
-
-
-@router_atletas.get(
-    '/',
-    summary='Consultar Atletas (com Filtros e Paginação)',
-    status_code=status.HTTP_200_OK,
-    response_model=Page[AtletaCustomOut]  # Response Customizado e Paginação
-)
-async def query_atletas(
-    db: Session = Depends(get_db),
-    params: Params = Depends(),
-    nome: Optional[str] = Query(None, description="Filtrar por nome do atleta"),
-    cpf: Optional[str] = Query(None, description="Filtrar por CPF do atleta")
-) -> Page[AtletaCustomOut]:
-    """
-    Endpoint para listar atletas com paginação e filtros por nome ou CPF.
-    """
-    # 1. Construir a query base com JOINs para acessar nome do CT e Categoria
-    query_stmt = select(
-        AtletaModel.nome, 
-        CentroTreinamentoModel.nome.label('centro_treinamento'), 
-        CategoriaModel.nome.label('categoria')
-    ).join(
-        CentroTreinamentoModel, AtletaModel.centro_treinamento_id == CentroTreinamentoModel.pk_id
-    ).join(
-        CategoriaModel, AtletaModel.categoria_id == CategoriaModel.pk_id
-    )
-    
-    # 2. Aplicar filtros de Query Parameter
-    if nome:
-        query_stmt = query_stmt.where(AtletaModel.nome.ilike(f'%{nome}%'))
-    if cpf:
-        query_stmt = query_stmt.where(AtletaModel.cpf == cpf)
-
-    # 3. Executar a query
-    resultados = db.execute(query_stmt).all()
-    
-    # 4. Customizar o retorno para o schema AtletaCustomOut
-    atletas_customizados = [
-        AtletaCustomOut(
-            nome=r.nome, 
-            centro_treinamento=r.centro_treinamento, 
-            categoria=r.categoria
-        ) for r in resultados
-    ]
-    
-    # 5. Aplicar Paginação
-    return paginate(atletas_customizados, params)
-
-
-# ====================================================================
-# 5. APLICAÇÃO PRINCIPAL (MAIN)
-# ====================================================================
-
-app = FastAPI(title='Crossfit API')
-
-# Inclusão das rotas com prefixos e tags
-app.include_router(router_categorias, prefix='/api/v1/categorias', tags=['categorias'])
-app.include_router(router_centros, prefix='/api/v1/centros_treinamento', tags=['centros_treinamento'])
-app.include_router(router_atletas, prefix='/api/v1/atletas', tags=['atletas'])
-
-# Adiciona o suporte a paginação para toda a API
-add_pagination(app)
-
-# Para rodar a aplicação, use o comando: uvicorn app:app --reload
+    status_code=status.HTTP_201
